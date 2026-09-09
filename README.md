@@ -1,95 +1,118 @@
 # Superjoin VIT 2026 — Fact Knowledge Layer
 
-This project implements a lightweight fact knowledge layer for PDF documents. It extracts numerical and semantic facts from PDFs, grounds them in source evidence, and compares them across documents to identify corroboration, contradiction, and contextual reconciliation.
+Extracts grounded facts from any PDF, compares them across documents, and explains corroboration, contradiction, and contextual reconciliation — powered by the local Ollama granite4.1:3b model.
 
 ## Setup and Run Instructions
 
-1. Clone or open this repository.
-2. Create a Python environment and install dependencies:
+### Prerequisites
+
+1. **Python 3.10+**
+2. **Ollama** (local LLM backend) — install from [ollama.com](https://ollama.com), then pull the model:
+   ```bash
+   ollama pull granite4.1:3b
+   ```
+   Verify it is running: `ollama list` should show `granite4.1:3b`.
+
+### Install and Run
 
 ```bash
 cd superjoin-pdf-analyser
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate    # macOS / Linux
 pip install -r requirements.txt
-```
 
-3. Start the app:
-
-```bash
 streamlit run app.py
 ```
 
-4. Open the local URL shown in the terminal (usually http://localhost:8501).
-5. Upload one or more PDFs or use the starter dataset under the `dataset/` folder.
-6. The app will display extracted facts, source evidence, and cross-document relationship checks.
+Open http://localhost:8501. Upload any PDF or click through the starter dataset under `dataset/`.
 
-## Video Demo
+### Environment Variables (optional)
 
-A short demo video is required for the assignment. This environment does not include a GitHub account or video-hosting setup, so the final external video link must be created and added after recording locally.
+| Variable | Default | Purpose |
+|---|---|---|
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | `granite4.1:3b` | Model to use for extraction |
+| `OLLAMA_WORKERS` | `2` | Parallel extraction workers |
+| `OLLAMA_TIMEOUT` | `600` | Seconds before a single call times out |
+| `EXTRACTION_CHUNK_CHARS` | `1200` | Max chars per LLM prompt chunk |
+| `MAX_PAGES_PER_PDF` | `20` | Cap on pages processed per PDF |
 
-Suggested demo flow (under 3 minutes):
+## Project Structure
 
-1. Open the app.
-2. Upload a PDF or open the dataset.
-3. Show the extracted facts table.
-4. Explain the four required cases:
-   - corroborated fact across documents
-   - likely contradiction
-   - context-based reconciliation
-   - extraction/logic failure and mitigation
-5. Show the evidence snippets used for reasoning.
+```
+superjoin-pdf-analyser/
+├── app.py                              # Streamlit UI
+├── src/knowledge_layer/                # Core engine (modular package)
+│   ├── config.py                       # Env-var configuration
+│   ├── models.py                       # Fact dataclass
+│   ├── text_extraction.py              # PyMuPDF page extraction + chunking
+│   ├── llm.py                          # Ollama client + JSON repair
+│   ├── normalization.py                # Unit/period/basis/concept inference
+│   ├── heuristic.py                    # Generic offline fallback extractor
+│   ├── fact_extraction.py              # Orchestrator (parallel Ollama calls)
+│   ├── comparison.py                   # Cross-document relationship reasoning
+│   ├── cases.py                        # Dynamic four-case selection
+│   └── dataset.py                      # Dataset file discovery
+├── dataset/                            # Starter PDFs
+│   ├── delhivery/
+│   └── india-macroeconomy/
+├── requirements.txt
+└── README.md
+```
 
 ## Approach
 
-### Core idea
-The application treats each fact as a grounded statement with:
+### Core Idea
 
-- source document
-- page number
-- subject/concept
-- value and unit
-- evidence snippet
-- qualifiers such as date, period, or scope
+Each fact is a grounded statement carrying: source document, page, subject, value, unit, period, basis, an evidence snippet, and a concept tag. This lets the system always explain *why* a fact is believed and point to its location in the source.
 
-This lets the system explain why a fact is believed, where it came from, and how it compares with other facts.
+### Extraction Pipeline
 
-### Architecture
+1. **PyMuPDF** extracts raw text from every PDF page.
+2. Text is split into sentence-aware chunks (default ~1200 chars).
+3. Each chunk is sent to **Ollama granite4.1:3b** asking for structured JSON facts.
+4. The model's response — which may be a JSON array, a single object, or concatenated objects — is **repaired and validated** into the strict `Fact` schema.
+5. Facts are deduplicated across chunks and normalised (units, periods, concepts).
+6. If Ollama is unreachable, a **generic heuristic extractor** (no document-specific rules) takes over automatically.
 
-- `knowledge_layer.py` handles PDF extraction, fact normalization, and cross-document comparison.
-- `app.py` provides the Streamlit UI for upload, inspection, and explanation.
-- `dataset/` contains starter PDFs for the assignment.
+This is completely document-agnostic: no facts, filenames, schemas, or document-specific regex patterns are hard-coded.
 
-### Important decisions
+### Comparison and Reasoning
 
-- We extracted facts using a hybrid rule-based approach rather than a fully hard-coded document schema.
-- Numeric metrics are normalized conservatively and grouped by concept to reduce false mismatches.
-- Relationship analysis checks whether facts are corroborated, contradictory, or only different because of different periods, units, or adjustments.
+Facts sharing a semantic concept are paired and classified as:
 
-### AI tools and libraries used
+- **Corroborated** — same concept, values agree within rounding
+- **Contradiction** — same concept, values disagree
+- **Reconciled by context** — values differ but the gap is explained by period, units, basis, or scope
+- **Different scope** — facts describe different subjects entirely
 
-- Python
-- PyMuPDF for PDF text extraction
-- Streamlit for a simple upload-and-inspect interface
-- Lightweight regex-driven fact extraction and reasoning heuristics
+The local model writes the human-readable explanation. A heuristic fallback covers the offline case.
+
+### Dynamic Four Cases
+
+The four required demonstration cases are **not hard-coded**. They are selected from the relationships actually produced during the current run, so the demo always reflects real extracted evidence.
+
+### AI Tools Used
+
+- **Ollama granite4.1:3b** — local LLM for extraction and reasoning (no API key required)
+- **PyMuPDF** — PDF text extraction
+- **Streamlit** — upload-and-inspect interface
+- **Python stdlib** — no external LLM SDKs needed
 
 ## Limitations and Next Steps
 
-This is a prototype, not a production-grade knowledge graph. The current implementation still has limits:
+- **3b model constraints**: granite4.1:3b sometimes produces shallow or noisy extractions and may miss implicit relationships. A larger model (e.g. 8-13B) would improve coverage.
+- **Period inference**: the model sometimes omits the `period` field; this is patched automatically via regex inference on the subject text.
+- **Slow per-chunk**: each chunk takes ~5-15s on a local 3b model, so a 30-page PDF takes 1-2 minutes. Parallel extraction (`OLLAMA_WORKERS=2`) partially mitigates this.
+- **No incremental ingestion**: facts are re-extracted from scratch each time; a persistent store would help for large document sets.
 
-- it relies on pattern-based extraction and may miss unusual fact formats
-- not all ambiguous statements are resolved automatically
-- relationship grouping is heuristic and can be improved with entity linking and richer metadata
-
-Next, I would add:
-
-- a real semantic parser or LLM-based fact extractor
-- better entity normalization and resolution
-- a database-backed fact store for incremental PDF ingestion
-- richer graph relationships and confidence scores
+Next steps:
+- Upgrade to a larger Ollama model (e.g. `llama3.1:8b` or `mistral:7b`)
+- Add a persistent fact store with incremental ingestion
+- Add graph visualisation of concept relationships
+- Add user feedback loop for extraction quality
 
 ## Additional Notes
 
-The assignment emphasizes not just extraction, but grounded reasoning. The strongest part of this project is that every fact is associated with evidence from the source PDF and compared in context, rather than treated as a disconnected number.
-
-The system is built to generalize beyond the starter documents and can accept new PDFs through the UI without relying on hard-coded facts or names.
+The system is built to generalise beyond the starter documents. It accepts any PDF through the UI, uses no hard-coded facts or document-specific rules, and dynamically derives the four required cases from the extracted evidence. Every fact is grounded in a source snippet and compared with reasoning — not just raw numeric matching.

@@ -1,99 +1,128 @@
+import sys
 import tempfile
 from pathlib import Path
 
 import streamlit as st
 
-from knowledge_layer import load_all_facts, load_default_documents, compare_facts, extract_facts_from_pdf
+# Ensure src is importable when running from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from src.knowledge_layer import (
+    ollama_available,
+    extract_facts_from_pdf,
+    compare_facts,
+    select_four_cases,
+    load_all_facts,
+    load_default_documents,
+)
+from src.knowledge_layer.config import MAX_PAGES_PER_PDF
 
 st.set_page_config(page_title="Superjoin Fact Knowledge Layer", layout="wide")
 
 DATASET_ROOT = Path(__file__).resolve().parent / "dataset"
 
-
-@st.cache_data(show_spinner="Reading starter PDFs...")
-def get_default_facts():
-    return load_all_facts(str(DATASET_ROOT))
-
-
-st.title("Superjoin Fact Knowledge Layer")
-st.caption("Upload PDFs or start with the starter dataset to ground facts, compare them, and explain differences.")
-
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Upload PDFs")
-    uploaded = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
-    st.info("The app accepts new PDFs without hard-coded assumptions and compares facts across evidence.")
+    uploaded = st.file_uploader(
+        "Choose PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    backend = "Ollama (granite4.1:3b)" if ollama_available() else "Generic heuristic"
+    st.success(f"Backend: {backend}")
+    st.info(
+        "Upload any PDF or use the starter dataset. "
+        "The system automatically extracts grounded facts, compares them "
+        "across documents, and shows the four required cases."
+    )
 
+# ── Data loading ─────────────────────────────────────────────────────────────
 if uploaded:
+    # Cache extraction per unique set of uploaded files (name+size fingerprint).
+    upload_key = tuple(sorted(f"{u.name}|{u.size}" for u in uploaded))
     with tempfile.TemporaryDirectory(prefix="superjoin-pdfs-") as temp_dir:
         temp_path = Path(temp_dir)
         for upload in uploaded:
             target = temp_path / Path(upload.name).name
             target.write_bytes(upload.getvalue())
         docs = [str(p) for p in sorted(temp_path.glob("*.pdf"))]
-        facts = [fact for pdf in docs for fact in extract_facts_from_pdf(pdf)]
+
+        if st.session_state.get("upload_key") != upload_key:
+            progress = st.progress(0.0, text="Extracting facts from uploaded PDFs...")
+            n_docs = len(docs)
+            counter = {"doc": 0}
+
+            def on_extract(_stage, done, total):
+                progress.progress(
+                    min(1.0, (counter["doc"] + done / max(1, total)) / max(1, n_docs)),
+                    text=f"Extracting page {done}/{total} of document {counter['doc'] + 1}/{n_docs}...",
+                )
+
+            session_facts = []
+            for pdf_path in docs:
+                session_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=on_extract,
+                                                            max_pages=MAX_PAGES_PER_PDF))
+                counter["doc"] += 1
+            progress.empty()
+            st.session_state["upload_key"] = upload_key
+            st.session_state["facts"] = session_facts
+            st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+        facts = st.session_state.get("facts", [])
 else:
     docs = load_default_documents(str(DATASET_ROOT))
-    facts = get_default_facts()
+    if not st.session_state.get("default_loaded"):
+        progress = st.progress(0.0, text="Extracting facts from starter PDFs...")
+        n_docs = len(docs)
+        counter = {"doc": 0}
+
+        def on_extract(_stage, done, total):
+            progress.progress(
+                min(1.0, (counter["doc"] + done / max(1, total)) / max(1, n_docs)),
+                text=f"Extracting page {done}/{total} of document {counter['doc'] + 1}/{n_docs}...",
+            )
+
+        session_facts = []
+        for pdf_path in docs:
+            session_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=on_extract,
+                                                        max_pages=MAX_PAGES_PER_PDF))
+            counter["doc"] += 1
+        progress.empty()
+        st.session_state["default_loaded"] = True
+        st.session_state["facts"] = session_facts
+        st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+    facts = st.session_state.get("facts", [])
 
 if not docs:
     st.warning("No PDFs found. Upload a PDF to begin.")
     st.stop()
 
-relations = compare_facts(facts)
+relations = st.session_state.get("relations", [])
+four_cases = select_four_cases(relations)
 
-st.subheader("Summary")
+# ── Header metrics ───────────────────────────────────────────────────────────
+st.title("Superjoin Fact Knowledge Layer")
+st.caption("Upload PDFs or start with the starter dataset to ground facts, compare them, and explain differences.")
+
 cols = st.columns(4)
 cols[0].metric("Documents processed", len(docs))
 cols[1].metric("Facts extracted", len(facts))
 cols[2].metric("Corroborations", sum(1 for r in relations if r["relation"] == "corroborated"))
-cols[3].metric("Comparisons", len(relations))
+cols[3].metric("Relationships found", len(relations))
 
-st.subheader("Four required cases")
+# ── Four required cases (dynamically produced) ───────────────────────────────
+st.subheader("Four required cases (derived from actual extraction results)")
 
-case_1 = {
-    "title": "1. Corroborated across documents",
-    "content": "IMF and the Economic Survey both point to India’s growth remaining strong, with IMF citing 6.5% in FY2024/25 and Economic Survey citing 6.4% in FY25; both are describing the same underlying trend with acceptable variance from rounding and report timing.",
-    "evidence": [
-        "IMF: 'Following economic growth of 6.5 percent in FY2024/25'",
-        "Economic Survey: 'India’s real GDP is estimated to grow by 6.4 per cent in FY25'"
-    ],
-}
-
-case_2 = {
-    "title": "2. Likely contradiction",
-    "content": "At first glance, 6.5% and 6.4% differ slightly. This looks like a contradiction, but it is a likely measurement/rounding difference rather than a real disagreement.",
-    "evidence": [
-        "IMF: 6.5% in FY2024/25",
-        "Economic Survey: 6.4% in FY25"
-    ],
-}
-
-case_3 = {
-    "title": "3. Apparent contradiction explained by context",
-    "content": "Delhivery reports 'FY24 EBITDA ₹127 Cr' while also noting 'Adj. EBITDA ₹76 Cr'. This is not contradictory because adjusted EBITDA excludes different items and uses a different operating basis.",
-    "evidence": [
-        "Delhivery: 'FY24 EBITDA increased ... ₹127 Cr'",
-        "Delhivery: 'Adj. EBITDA / Adj. EBITDA margin ... ₹76 Cr / 0.9%'"
-    ],
-}
-
-case_4 = {
-    "title": "4. Extraction or reasoning failure",
-    "content": "A model that only compares raw numeric values would mistakenly flag the GDP figures as separate facts or ignore that the same concept is expressed with different periods and bases. The system handles this by tagging period, scope, and adjustment context and only comparing facts that share a concept and measurement basis.",
-    "evidence": [
-        "Issue: period mismatch, scope mismatch, and adjusted-vs-reported earnings",
-        "Fix: align facts by concept, year, and unit metadata before relationship checks"
-    ],
-}
-
-for idx, case in enumerate([case_1, case_2, case_3, case_4], start=1):
+for case in four_cases:
     with st.expander(case["title"], expanded=True):
         st.write(case["content"])
         for ev in case["evidence"]:
-            st.markdown("- " + ev)
+            st.markdown(f"- `{ev}`")
+        if not case["evidence"]:
+            st.caption("No example found in the current document set.")
 
-st.subheader("Fact table")
+# ── Fact table ───────────────────────────────────────────────────────────────
+st.subheader("Extracted facts")
 if facts:
     fact_df = []
     for fact in facts:
@@ -106,24 +135,35 @@ if facts:
             "unit": fact.unit,
             "period": fact.period,
             "basis": fact.basis,
-            "qualifiers": fact.qualifiers,
             "evidence": fact.evidence[:180],
+            "by": fact.extracted_by,
         })
-    st.dataframe(fact_df, use_container_width=True, height=400)
+    st.dataframe(fact_df, width="stretch", height=400)
 
+# ── Relationships ────────────────────────────────────────────────────────────
 st.subheader("Cross-document relationship checks")
 if relations:
-    for rel in relations[:15]:
-        st.markdown(f"- **{rel['relation']}**: {rel['fact_a']} vs {rel['fact_b']} | {rel['source_a']} / {rel['source_b']} | {rel['explanation']}")
+    for rel in relations[:20]:
+        label = rel["relation"].replace("_", " ").title()
+        st.markdown(
+            f"- **{label}**: {rel['fact_a']}  vs  {rel['fact_b']}  \n"
+            f"  _{rel['explanation']}_"
+        )
 else:
     st.info("No meaningful cross-document relationships detected yet.")
 
+# ── Evidence viewer ──────────────────────────────────────────────────────────
 st.subheader("Evidence viewer")
-selected = st.selectbox("Pick a fact to inspect", [f"{fact.source} · page {fact.page} · {fact.subject}" for fact in facts], index=0 if facts else None)
-if selected:
-    fact = next(f for f in facts if f"{f.source} · page {f.page} · {f.subject}" == selected)
-    st.write(f"**Subject:** {fact.subject}")
-    st.write(f"**Value:** {fact.value} {fact.unit}")
-    st.write(f"**Evidence:** {fact.evidence}")
+if facts:
+    labels = [f"{f.source}  p{f.page}  {f.subject}" for f in facts]
+    selected_label = st.selectbox("Pick a fact to inspect", labels)
+    if selected_label:
+        fact = next(f for f in facts if f"{f.source}  p{f.page}  {f.subject}" == selected_label)
+        st.write(f"**Subject:** {fact.subject}")
+        st.write(f"**Value:** {fact.value} {fact.unit}")
+        st.write(f"**Period:** {fact.period or 'not specified'}")
+        st.write(f"**Basis:** {fact.basis or 'reported'}")
+        st.write(f"**Source:** {fact.source}, page {fact.page}")
+        st.code(fact.evidence, language=None)
 
 st.caption("Prototype built for the Superjoin VIT 2026 Engineering Intern assignment.")
