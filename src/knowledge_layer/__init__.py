@@ -10,6 +10,7 @@ from .llm import (
     gemini_available,
     get_active_backend,
     get_used_backend,
+    set_used_backend,
     ollama_available,
     reset_availability,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "gemini_available",
     "get_active_backend",
     "get_used_backend",
+    "set_used_backend",
     "reset_availability",
     "extract_facts_from_pdf",
     "compare_facts",

@@ -54,6 +54,10 @@ class ModelTimeoutError(TimeoutError):
     """Raised when a model response exceeds the allowed wall-clock budget, so
     the caller can fall back to the standard (heuristic) approach."""
 
+
+class ModelUnavailableError(RuntimeError):
+    """Raised after all configured model backends have been exhausted."""
+
 # Availability probes are cached per model so each backend's reachability is
 # checked only once per process (e.g. a single Ollama /api/tags round-trip),
 # rather than repeated on every call. This matters because call_model falls
@@ -92,7 +96,7 @@ def gemini_available(refresh: bool = False) -> bool:
     Cached so the availability of each model is determined only once.
     """
     if refresh or _availability["gemini"] is None:
-        _availability["gemini"] = bool(GEMINI_API_KEY)
+        _availability["gemini"] = bool(GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "").strip())
         logger.info("Gemini availability: %s (model=%s)", _availability["gemini"], GEMINI_MODEL)
     return bool(_availability["gemini"])
 
@@ -113,6 +117,12 @@ def get_active_backend() -> str:
 def get_used_backend() -> str:
     """Return the backend that most recently served a model call ('' if none)."""
     return _used_backend
+
+
+def set_used_backend(backend: str) -> None:
+    """Record the path that supplied the current result (including cache)."""
+    global _used_backend
+    _used_backend = backend
 
 
 def reset_availability() -> None:
@@ -181,6 +191,9 @@ def _gemini_request(system: str, user: str) -> str:
                 # Quota/rate-limit exhausted: hand straight off to the fallback
                 # backend instead of waiting inside a retry loop.
                 logger.warning("Gemini rate-limit (429); switching to fallback backend")
+                raise
+            if exc.code != 200:
+                logger.warning("Gemini request failed with HTTP %s: %s", exc.code, error_body[:400])
                 raise
             if attempt < 2:
                 continue
@@ -276,6 +289,8 @@ def call_model(system: str, user: str, use_json_format: bool = False) -> str:
     """
     global _used_backend
 
+    _used_backend = "heuristic"
+
     if gemini_available():
         try:
             result = _gemini_request(system, user)
@@ -283,8 +298,11 @@ def call_model(system: str, user: str, use_json_format: bool = False) -> str:
             return result
         except Exception as exc:  # noqa: BLE001
             logger.warning("Gemini backend failed; trying Ollama fallback. Error: %s", exc)
-            # Remember the failure (incl. 429 quota) so we don't retry Gemini again.
-            _availability["gemini"] = False
+            # Auth, quota, and malformed-request failures will not succeed on
+            # subsequent chunks, so avoid repeatedly calling Gemini. Network
+            # and server failures remain eligible for a later retry.
+            if isinstance(exc, urllib.error.HTTPError) and exc.code in (400, 401, 403, 404, 429):
+                _availability["gemini"] = False
 
     if ollama_available():
         try:
@@ -295,10 +313,13 @@ def call_model(system: str, user: str, use_json_format: bool = False) -> str:
             logger.warning("Ollama response exceeded %ss; falling back to standard approach", OLLAMA_CALL_TIMEOUT)
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Ollama fallback also failed: %s", exc)
-            raise
+            logger.warning("Ollama fallback also failed: %s", exc)
+            # ollama_chat has already applied its configured retries. Do not
+            # pay that cost for every remaining document chunk in this run.
+            _availability["ollama"] = False
+            raise ModelUnavailableError("Ollama failed after its retry budget") from exc
 
-    raise RuntimeError("No usable AI backend is available. Start Ollama or set GEMINI_API_KEY.")
+    raise ModelUnavailableError("No usable AI backend is available. Start Ollama or set GEMINI_API_KEY.")
 
 
 def extract_json_objects(text: str) -> List[Dict[str, Any]]:

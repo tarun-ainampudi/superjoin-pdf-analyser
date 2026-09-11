@@ -108,6 +108,22 @@ class BackendAvailabilityTests(unittest.TestCase):
             llm._ollama_reachable = orig_probe
             llm.reset_availability()
 
+    def test_failed_ollama_is_disabled_for_remaining_chunks(self):
+        llm._availability["gemini"] = False
+        llm._availability["ollama"] = None
+        orig_probe = llm._ollama_reachable
+        orig_chat = llm.ollama_chat
+        llm._ollama_reachable = lambda: True
+        llm.ollama_chat = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline"))
+        try:
+            with self.assertRaises(llm.ModelUnavailableError):
+                llm.call_model("system", "user")
+            self.assertFalse(llm._availability["ollama"])
+        finally:
+            llm._ollama_reachable = orig_probe
+            llm.ollama_chat = orig_chat
+            llm.reset_availability()
+
 
 if __name__ == "__main__":
     unittest.main()

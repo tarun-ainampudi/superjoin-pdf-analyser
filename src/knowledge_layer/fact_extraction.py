@@ -14,7 +14,16 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .cache import load_cached_facts, save_cached_facts
 from .config import EXTRACTION_CHUNK_CHARS, MAX_FACTS_PER_CHUNK, MAX_PAGES_PER_PDF
 from .heuristic import heuristic_extract_all_pages
-from .llm import ModelTimeoutError, call_model, extract_json_objects, gemini_available, ollama_available
+from .llm import (
+    ModelTimeoutError,
+    ModelUnavailableError,
+    call_model,
+    extract_json_objects,
+    gemini_available,
+    get_used_backend,
+    ollama_available,
+    set_used_backend,
+)
 from .models import Fact
 from .normalization import (
     safe_float,
@@ -44,7 +53,8 @@ EXTRACT_SYSTEM = (
 
 
 def _parse_model_facts(page: int, raw: str, filename: str, source_path: str,
-                       chunk_text_ref: str, start_counter: int) -> List[Fact]:
+                       chunk_text_ref: str, start_counter: int,
+                       extracted_by: str) -> List[Fact]:
     """Convert a repaired model response into validated Fact objects."""
     facts: List[Fact] = []
     counter = start_counter
@@ -73,7 +83,7 @@ def _parse_model_facts(page: int, raw: str, filename: str, source_path: str,
             concept=infer_concept(subject),
             normalized_value=safe_float(value),
             confidence=0.9,
-            extracted_by="ollama",
+            extracted_by=extracted_by,
         ))
     return facts
 
@@ -110,19 +120,24 @@ def extract_facts_with_ollama(filename: str, pages: List[Dict[str, Any]], source
             if status_cb and raw:
                 status_cb(filename, page, raw.strip())
             if raw:
-                results.append((page, chunk, raw))
+                results.append((page, chunk, raw, get_used_backend()))
         except ModelTimeoutError:
             # The model is too slow - hand the whole document off to the
             # standard (heuristic) extractor instead of waiting further.
             logger.warning("Extraction timed out on chunk %s/%s for page %s; falling back to heuristic extractor", idx, total, page)
+            raise
+        except ModelUnavailableError:
+            # Retrying every remaining chunk after both backends are known to
+            # be unavailable is slow and can leave a misleading partial result.
+            logger.warning("All model backends became unavailable on chunk %s/%s; using heuristic extraction", idx, total)
             raise
         except Exception as e:  # noqa: BLE001 - a bad chunk should not kill a run
             logger.warning("Extraction chunk %s/%s failed for page %s: %s", idx, total, page, e)
 
     facts: List[Fact] = []
     counter = 0
-    for page, chunk, raw in results:
-        parsed = _parse_model_facts(page, raw, filename, source_path, chunk, counter)
+    for page, chunk, raw, backend in results:
+        parsed = _parse_model_facts(page, raw, filename, source_path, chunk, counter, backend)
         counter += len(parsed)
         if len(parsed) > MAX_FACTS_PER_CHUNK:
             parsed = parsed[:MAX_FACTS_PER_CHUNK]
@@ -148,8 +163,9 @@ def extract_facts_from_pdf(path: str,
     cache_path = Path(cache_dir) if cache_dir else None
     if use_cache and cache_path is not None:
         cached = load_cached_facts(path, cache_path)
-        if cached:
+        if cached is not None:
             logger.info("Using cached facts for %s from %s", path, cache_path)
+            set_used_backend("cache")
             return dedupe(cached)
 
     pages = extract_pdf_pages(path)
@@ -165,8 +181,8 @@ def extract_facts_from_pdf(path: str,
         logger.info("AI backend available for %s; extracting facts with LLM path", path)
         try:
             facts = extract_facts_with_ollama(filename, pages, path, progress_cb=passthrough, status_cb=status_cb)
-        except ModelTimeoutError:
-            logger.warning("Model response too slow for %s; using heuristic extractor", path)
+        except (ModelTimeoutError, ModelUnavailableError):
+            logger.warning("Model extraction failed for %s; using heuristic extractor", path)
             facts = []
         if not facts:
             logger.warning("LLM extraction returned no usable facts for %s; falling back to heuristic extractor", path)

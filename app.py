@@ -2,6 +2,7 @@ import logging
 import sys
 import tempfile
 import uuid
+import hashlib
 from pathlib import Path
 
 import streamlit as st
@@ -12,15 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from src.knowledge_layer import (
     get_active_backend,
     get_used_backend,
-    ollama_available,
     reset_availability,
     extract_facts_from_pdf,
     compare_facts,
     select_four_cases,
     load_default_documents,
 )
-from src.knowledge_layer.cache import clear_session_cache, get_dataset_cache_dir, get_session_cache_dir
-from src.knowledge_layer.config import GEMINI_MODEL, MAX_PAGES_PER_PDF
+from src.knowledge_layer.cache import get_dataset_cache_dir, get_session_cache_dir
+from src.knowledge_layer.config import GEMINI_MODEL, MAX_PAGES_PER_PDF, OLLAMA_MODEL
 
 st.set_page_config(page_title="Superjoin Fact Knowledge Layer", layout="wide")
 
@@ -35,8 +35,7 @@ logging.basicConfig(
 
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = uuid.uuid4().hex
-    clear_session_cache(ROOT_DIR)
-    logging.info("Initialized new app session %s and cleared session cache", st.session_state["session_id"])
+    logging.info("Initialized app session %s", st.session_state["session_id"])
 
 if "model_events" not in st.session_state:
     st.session_state["model_events"] = []
@@ -50,6 +49,16 @@ logging.info("Session cache dir: %s", SESSION_CACHE_DIR)
 # so a model is never probed more than once per run.
 reset_availability()
 
+
+def _backend_label(backend_name: str) -> str:
+    if backend_name == "gemini":
+        return f"Gemini API ({GEMINI_MODEL})"
+    if backend_name == "ollama":
+        return f"Ollama ({OLLAMA_MODEL})"
+    if backend_name == "cache":
+        return "Loaded from cache"
+    return "Generic heuristic"
+
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Upload PDFs")
@@ -58,26 +67,29 @@ with st.sidebar:
         type=["pdf"],
         accept_multiple_files=True,
     )
-    active_backend = get_used_backend()
-    if active_backend == "gemini":
-        backend = f"Gemini API ({GEMINI_MODEL})"
-    elif active_backend == "ollama":
-        backend = "Ollama (granite4.1:3b)"
-    elif active_backend == "cache":
-        backend = "Loaded from cahce"
-    else:
-        backend = "Generic heuristic"
-    st.success(f"Backend: {backend}")
+    backend_status = st.empty()
     st.info(
         "Upload any PDF. "
         "The system automatically extracts grounded facts, compares them "
         "across documents, and shows the four required cases."
     )
 
+
+def _render_backend_status() -> None:
+    # The sidebar is created before extraction. Updating its placeholder after
+    # loading prevents it from showing the previous run's backend.
+    backend_name = st.session_state.get("used_backend", get_used_backend())
+    backend_status.success(f"Backend: {_backend_label(backend_name)}")
+
+
+_render_backend_status()
+
 # ── Data loading ─────────────────────────────────────────────────────────────
 if uploaded:
-    # Cache extraction per unique set of uploaded files (name+size fingerprint).
-    upload_key = tuple(sorted(f"{u.name}|{u.size}" for u in uploaded))
+    # Include content, not just name and size: distinct PDFs can share both.
+    upload_key = tuple(sorted(
+        (u.name, u.size, hashlib.sha256(u.getvalue()).hexdigest()) for u in uploaded
+    ))
     with tempfile.TemporaryDirectory(prefix="superjoin-pdfs-") as temp_dir:
         temp_path = Path(temp_dir)
         for upload in uploaded:
@@ -113,6 +125,7 @@ if uploaded:
                         st.code(item["response"] or "No response returned", language=None)
 
             session_facts = []
+            document_backends = []
             for pdf_path in docs:
                 logging.info("Processing uploaded PDF %s with session cache %s", pdf_path, SESSION_CACHE_DIR)
                 session_facts.extend(
@@ -124,12 +137,23 @@ if uploaded:
                         status_cb=on_model_status,
                     )
                 )
-                st.session_state["used_backend"] = get_used_backend() or get_active_backend()
+                used_backend = get_used_backend() or get_active_backend()
+                document_backends.append(used_backend)
+                st.session_state["used_backend"] = used_backend
                 counter["doc"] += 1
             progress.empty()
             st.session_state["upload_key"] = upload_key
             st.session_state["facts"] = session_facts
-            st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+            # Cache hits already contain extracted facts. Do not turn a fast
+            # cached load into a slow Gemini request merely to regenerate
+            # explanations; the deterministic relationship heuristic is used.
+            all_from_cache = bool(document_backends) and all(
+                backend == "cache" for backend in document_backends
+            )
+            st.session_state["relations"] = compare_facts(
+                session_facts,
+                use_llm=False if all_from_cache else get_active_backend() != "none",
+            )
             st.success(f"Finished processing {len(docs)} uploaded document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
         facts = st.session_state.get("facts", [])
 else:
@@ -162,6 +186,7 @@ else:
                     st.code(item["response"] or "No response returned", language=None)
 
         session_facts = []
+        document_backends = []
         for pdf_path in docs:
             logging.info("Processing default dataset PDF %s with dataset cache %s", pdf_path, DATASET_CACHE_DIR)
             session_facts.extend(
@@ -173,18 +198,33 @@ else:
                     status_cb=on_model_status,
                 )
             )
-            st.session_state["used_backend"] = get_used_backend() or get_active_backend()
+            used_backend = get_used_backend() or get_active_backend()
+            document_backends.append(used_backend)
+            st.session_state["used_backend"] = used_backend
             counter["doc"] += 1
         progress.empty()
         st.session_state["default_loaded"] = True
         st.session_state["facts"] = session_facts
-        st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+        # Cached extraction should not make any external model calls. Use the
+        # deterministic comparison path until at least one PDF is freshly
+        # extracted in this run.
+        all_from_cache = bool(document_backends) and all(
+            backend == "cache" for backend in document_backends
+        )
+        st.session_state["relations"] = compare_facts(
+            session_facts,
+            use_llm=False if all_from_cache else get_active_backend() != "none",
+        )
         st.success(f"Finished processing {len(docs)} starter document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
     facts = st.session_state.get("facts", [])
 
 if not docs:
     st.warning("No PDFs found. Upload a PDF to begin.")
     st.stop()
+
+# Refresh the already-rendered sidebar with the path that actually supplied
+# facts in this run (cache, Gemini, Ollama, or the heuristic fallback).
+_render_backend_status()
 
 relations = st.session_state.get("relations", [])
 four_cases = select_four_cases(relations)

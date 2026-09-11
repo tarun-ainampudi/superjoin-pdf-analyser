@@ -2,14 +2,15 @@
 
 Facts sharing a semantic concept (and subject) are paired and classified as
 corroborated, a contradiction, reconciled by context, or different scope.
-The local Ollama model writes the human-readable explanation; a document-
-agnostic heuristic covers the offline case.
+The configured model chain writes the human-readable explanation; a
+document-agnostic heuristic covers the offline case.
 """
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from .config import RELATION_BUDGET
-from .llm import ollama_available, ollama_chat, extract_json_objects
+from .llm import call_model, extract_json_objects, get_active_backend
 from .models import Fact
 from .normalization import subject_key
 
@@ -22,6 +23,7 @@ RELATION_SYSTEM = (
 )
 
 VALID_RELATIONS = {"corroborated", "contradiction", "reconciled_by_context", "different_scope"}
+logger = logging.getLogger("superjoin.comparison")
 
 
 def _fact_repr(fact: Fact) -> str:
@@ -36,15 +38,18 @@ def _llm_relation(fact_a: Fact, fact_b: Fact) -> Optional[Dict[str, Any]]:
         "How are these two facts related?"
     )
     try:
-        raw = ollama_chat(RELATION_SYSTEM, user, use_json_format=False)
+        # Use the same Gemini -> Ollama fallback chain as extraction. Relation
+        # checks used to bypass Gemini entirely and silently lost their model
+        # fallback whenever the local runtime was unavailable.
+        raw = call_model(RELATION_SYSTEM, user, use_json_format=False)
         objs = extract_json_objects(raw)
         if objs:
             rel = str(objs[0].get("relation", "")).lower().strip()
             expl = str(objs[0].get("explanation", "")).strip()
             if rel in VALID_RELATIONS:
                 return {"relation": rel, "explanation": expl}
-    except Exception as e:  # noqa: BLE001
-        print(f"[ollama] relation comparison failed: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Model relation comparison failed; using heuristic: %s", exc)
     return None
 
 
@@ -155,7 +160,7 @@ def compare_facts(all_facts: List[Fact], use_llm: Optional[bool] = None) -> List
     from the resulting relations.
     """
     if use_llm is None:
-        use_llm = ollama_available()
+        use_llm = get_active_backend() != "none"
 
     buckets: Dict[str, List[Fact]] = {}
     skipped = 0
