@@ -19,6 +19,19 @@ The application uses a resilient model chain:
 - Groups live extraction output by page, with the latest processed page first; the live output is removed when final results are ready.
 - Persists dataset and upload fact caches, including compatibility with the previous cache-key format.
 
+## Video
+https://github.com/user-attachments/assets/425075c0-1bef-4c53-b809-897ce6126c5e
+
+## Approach
+
+The application treats a PDF as a source of evidence rather than as free-form context for a chat response. It extracts page-level text with PyMuPDF, splits that text into sentence-aware chunks, and asks the active model to return structured facts. Each fact retains its document, page, value, unit, period, basis, concept, confidence, and an evidence snippet so that a result can be traced back to the PDF.
+
+The architecture separates the Streamlit interface from the knowledge-layer modules: text extraction and chunking, model clients, fact extraction, normalization, comparison, and caching. This keeps the comparison logic deterministic where possible and makes backend failures independent of the user interface. Facts are normalized before comparison, then classified as corroborated, contradictory, reconciled by context, or different in scope.
+
+Reliability and usability drove the main trade-offs. Gemini is preferred for quality, Ollama provides a local alternative, and a lightweight heuristic extractor keeps the app useful offline; the latter is intentionally less precise. Model calls are serial and bounded by timeouts/retries to avoid exhausting local resources or API quota, at the cost of slower processing for large uncached PDFs. Content-addressed caching avoids repeating extraction work, while preserving evidence rather than caching an ungrounded summary.
+
+AI tools used in the product are Google's Gemini API and a locally served Ollama model. They are used only for structured fact extraction and, within a budget, relationship explanations; deterministic code handles probing, fallback, parsing repair, normalization, caching, and final comparison. The project was developed with AI-assisted coding support.
+
 ## Requirements
 
 - Python 3.10 or later
@@ -154,3 +167,9 @@ The tests cover backend-probe caching, Gemini-to-Ollama fallback, timeout handli
 - The heuristic fallback focuses on generic numeric patterns and is less precise than a working model backend.
 - Facts and relationships should be reviewed against their displayed evidence before being used for important decisions.
 - The app processes model requests serially to reduce local load and API quota pressure; large fresh PDFs can therefore take time.
+
+Next, I would add OCR for scanned PDFs and stronger table extraction, improve entity/concept resolution across differently worded documents, and support user feedback to correct or confirm extracted facts. Other useful extensions are background/parallel processing with progress persistence, exportable audit reports, and evaluation datasets that measure extraction and relationship accuracy by document type.
+
+## Additional Notes
+
+The repository includes a bundled Delhivery and India macroeconomy dataset so the application can be demonstrated immediately, but the same workflow supports PDF uploads from the sidebar. The active backend is shown in the UI, and every displayed fact includes page-level evidence to make validation straightforward. A working Gemini or Ollama backend is optional: the offline fallback and cache allow the app to remain functional when neither is available.
