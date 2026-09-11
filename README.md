@@ -33,8 +33,7 @@ Open http://localhost:8501. Upload any PDF or click through the starter dataset 
 |---|---|---|
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `granite4.1:3b` | Model to use for extraction |
-| `OLLAMA_WORKERS` | `2` | Parallel extraction workers |
-| `OLLAMA_TIMEOUT` | `600` | Seconds before a single call times out |
+| `OLLAMA_CALL_TIMEOUT` | `60` | Max seconds for a single Ollama response before falling back to the heuristic extractor |
 | `EXTRACTION_CHUNK_CHARS` | `1200` | Max chars per LLM prompt chunk |
 | `MAX_PAGES_PER_PDF` | `20` | Cap on pages processed per PDF |
 
@@ -47,10 +46,10 @@ superjoin-pdf-analyser/
 │   ├── config.py                       # Env-var configuration
 │   ├── models.py                       # Fact dataclass
 │   ├── text_extraction.py              # PyMuPDF page extraction + chunking
-│   ├── llm.py                          # Ollama client + JSON repair
+│   ├── llm.py                          # Ollama + Gemini clients, fallback, JSON repair
 │   ├── normalization.py                # Unit/period/basis/concept inference
 │   ├── heuristic.py                    # Generic offline fallback extractor
-│   ├── fact_extraction.py              # Orchestrator (parallel Ollama calls)
+│   ├── fact_extraction.py              # Orchestrator (serial model calls)
 │   ├── comparison.py                   # Cross-document relationship reasoning
 │   ├── cases.py                        # Dynamic four-case selection
 │   └── dataset.py                      # Dataset file discovery
@@ -71,10 +70,12 @@ Each fact is a grounded statement carrying: source document, page, subject, valu
 
 1. **PyMuPDF** extracts raw text from every PDF page.
 2. Text is split into sentence-aware chunks (default ~1200 chars).
-3. Each chunk is sent to **Ollama granite4.1:3b** asking for structured JSON facts.
+3. Each chunk is sent to the active model **one request at a time (serial)**, asking for structured JSON facts.
 4. The model's response — which may be a JSON array, a single object, or concatenated objects — is **repaired and validated** into the strict `Fact` schema.
 5. Facts are deduplicated across chunks and normalised (units, periods, concepts).
-6. If Ollama is unreachable, a **generic heuristic extractor** (no document-specific rules) takes over automatically.
+6. Fallbacks (in order): **Gemini API** (if a key is configured) → **Ollama** → **generic heuristic extractor** (no document-specific rules).
+   - A Gemini **429 (quota exceeded)** hands straight off to Ollama.
+   - If an **Ollama response takes more than one minute**, extraction falls back to the heuristic extractor.
 
 This is completely document-agnostic: no facts, filenames, schemas, or document-specific regex patterns are hard-coded.
 
@@ -104,7 +105,7 @@ The four required demonstration cases are **not hard-coded**. They are selected 
 
 - **3b model constraints**: granite4.1:3b sometimes produces shallow or noisy extractions and may miss implicit relationships. A larger model (e.g. 8-13B) would improve coverage.
 - **Period inference**: the model sometimes omits the `period` field; this is patched automatically via regex inference on the subject text.
-- **Slow per-chunk**: each chunk takes ~5-15s on a local 3b model, so a 30-page PDF takes 1-2 minutes. Parallel extraction (`OLLAMA_WORKERS=2`) partially mitigates this.
+- **Slow per-chunk**: each chunk takes ~5-15s on a local 3b model, so a 30-page PDF takes a few minutes. Requests are made serially on purpose so a free/quota-limited model is never hammered; an Ollama call that exceeds `OLLAMA_CALL_TIMEOUT` (default 1 minute) automatically falls back to the heuristic extractor.
 - **No incremental ingestion**: facts are re-extracted from scratch each time; a persistent store would help for large document sets.
 
 Next steps:

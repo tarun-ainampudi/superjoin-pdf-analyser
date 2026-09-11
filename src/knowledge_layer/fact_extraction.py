@@ -1,17 +1,20 @@
 """Fact extraction orchestration.
 
-Text pages are chunked, sent to the local Ollama model (in parallel), the
-responses are repaired and validated into ``Fact`` objects, and results are
-deduplicated. If the model is unavailable a generic heuristic takes over.
+Text pages are chunked and sent to the model one request at a time (serial).
+Responses are repaired and validated into ``Fact`` objects, and results are
+deduplicated. If the model is unavailable, too slow, or quota-limited, a
+generic heuristic takes over.
 """
 
+import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Union
 
-from .config import EXTRACTION_CHUNK_CHARS, MAX_FACTS_PER_CHUNK, MAX_PAGES_PER_PDF, OLLAMA_WORKERS
+from .cache import load_cached_facts, save_cached_facts
+from .config import EXTRACTION_CHUNK_CHARS, MAX_FACTS_PER_CHUNK, MAX_PAGES_PER_PDF
 from .heuristic import heuristic_extract_all_pages
-from .llm import ollama_available, ollama_chat, extract_json_objects
+from .llm import ModelTimeoutError, call_model, extract_json_objects, gemini_available, ollama_available
 from .models import Fact
 from .normalization import (
     safe_float,
@@ -23,6 +26,8 @@ from .normalization import (
     dedupe,
 )
 from .text_extraction import extract_pdf_pages, chunk_text, evidence_snippet
+
+logger = logging.getLogger("superjoin.fact_extraction")
 
 EXTRACT_SYSTEM = (
     "You are a precise fact extractor for business and financial documents. "
@@ -74,7 +79,8 @@ def _parse_model_facts(page: int, raw: str, filename: str, source_path: str,
 
 
 def extract_facts_with_ollama(filename: str, pages: List[Dict[str, Any]], source_path: str,
-                              progress_cb: Optional[Callable[[int, int], None]] = None) -> List[Fact]:
+                              progress_cb: Optional[Callable[[int, int], None]] = None,
+                              status_cb: Optional[Callable[[str, int, str], None]] = None) -> List[Fact]:
     tasks: List[tuple] = []
     for page_info in pages:
         page = page_info["page"]
@@ -86,39 +92,36 @@ def extract_facts_with_ollama(filename: str, pages: List[Dict[str, Any]], source
                 tasks.append((page, chunk))
 
     total = len(tasks)
-    results: List[Optional[tuple]] = [None] * total
-    done = 0
+    results: List[tuple] = []
 
-    def work(task: tuple) -> tuple:
-        page, chunk = task
+    # Send one request at a time (serial) so we never hammer the model and burn
+    # through its quota. This is a test prototype, so low-and-slow is preferred.
+    for idx, (page, chunk) in enumerate(tasks, start=1):
+        if progress_cb:
+            progress_cb(idx, total)
         try:
-            raw = ollama_chat(
+            logger.info("Processing extraction chunk %s/%s for page %s (%s chars)", idx, total, page, len(chunk))
+            raw = call_model(
                 EXTRACT_SYSTEM,
                 f"Extract all facts from this document text:\n\n{chunk}",
                 use_json_format=False,
             )
-            return page, chunk, raw
-        except Exception as e:  # noqa: BLE001 - a bad chunk should not kill a run
-            print(f"[ollama] extraction chunk failed (page {page}): {e}")
-            return page, chunk, None
-
-    with ThreadPoolExecutor(max_workers=OLLAMA_WORKERS) as executor:
-        future_map = {executor.submit(work, t): i for i, t in enumerate(tasks)}
-        for future in as_completed(future_map):
-            idx = future_map[future]
-            page, chunk, raw = future.result()
-            done += 1
-            if progress_cb:
-                progress_cb(done, total)
+            logger.info("Extraction chunk %s/%s succeeded for page %s; response length=%s", idx, total, page, len(raw or ""))
+            if status_cb and raw:
+                status_cb(filename, page, raw.strip())
             if raw:
-                results[idx] = (page, chunk, raw)
+                results.append((page, chunk, raw))
+        except ModelTimeoutError:
+            # The model is too slow - hand the whole document off to the
+            # standard (heuristic) extractor instead of waiting further.
+            logger.warning("Extraction timed out on chunk %s/%s for page %s; falling back to heuristic extractor", idx, total, page)
+            raise
+        except Exception as e:  # noqa: BLE001 - a bad chunk should not kill a run
+            logger.warning("Extraction chunk %s/%s failed for page %s: %s", idx, total, page, e)
 
     facts: List[Fact] = []
     counter = 0
-    for item in results:
-        if item is None:
-            continue
-        page, chunk, raw = item
+    for page, chunk, raw in results:
         parsed = _parse_model_facts(page, raw, filename, source_path, chunk, counter)
         counter += len(parsed)
         if len(parsed) > MAX_FACTS_PER_CHUNK:
@@ -129,7 +132,10 @@ def extract_facts_with_ollama(filename: str, pages: List[Dict[str, Any]], source
 
 def extract_facts_from_pdf(path: str,
                            progress_cb: Optional[Callable[[str, int, int], None]] = None,
-                           max_pages: Optional[int] = None) -> List[Fact]:
+                           max_pages: Optional[int] = None,
+                           cache_dir: Optional[Union[str, Path]] = None,
+                           use_cache: bool = True,
+                           status_cb: Optional[Callable[[str, int, str], None]] = None) -> List[Fact]:
     """Extract grounded facts from any PDF.
 
     ``progress_cb`` is an optional ``(stage, done, total)`` callback used by
@@ -138,6 +144,14 @@ def extract_facts_from_pdf(path: str,
     ``max_pages`` caps the number of pages processed (defaults to the
     ``MAX_PAGES_PER_PDF`` config value) so large PDFs stay responsive.
     """
+    logger.info("Starting PDF fact extraction for %s (max_pages=%s, cache_dir=%s)", path, max_pages, cache_dir)
+    cache_path = Path(cache_dir) if cache_dir else None
+    if use_cache and cache_path is not None:
+        cached = load_cached_facts(path, cache_path)
+        if cached:
+            logger.info("Using cached facts for %s from %s", path, cache_path)
+            return dedupe(cached)
+
     pages = extract_pdf_pages(path)
     if len(pages) > (max_pages or MAX_PAGES_PER_PDF):
         pages = pages[: max_pages or MAX_PAGES_PER_PDF]
@@ -147,11 +161,22 @@ def extract_facts_from_pdf(path: str,
         if progress_cb:
             progress_cb("extracting", done, total)
 
-    if ollama_available():
-        facts = extract_facts_with_ollama(filename, pages, path, progress_cb=passthrough)
+    if ollama_available() or gemini_available():
+        logger.info("AI backend available for %s; extracting facts with LLM path", path)
+        try:
+            facts = extract_facts_with_ollama(filename, pages, path, progress_cb=passthrough, status_cb=status_cb)
+        except ModelTimeoutError:
+            logger.warning("Model response too slow for %s; using heuristic extractor", path)
+            facts = []
         if not facts:
-            # Model produced nothing usable - fall back to heuristics.
+            logger.warning("LLM extraction returned no usable facts for %s; falling back to heuristic extractor", path)
             facts = heuristic_extract_all_pages(filename, pages, path)
-        return dedupe(facts)
+        deduped = dedupe(facts)
+    else:
+        logger.warning("No AI backend available for %s; using heuristic extractor", path)
+        deduped = dedupe(heuristic_extract_all_pages(filename, pages, path))
 
-    return dedupe(heuristic_extract_all_pages(filename, pages, path))
+    if use_cache and cache_path is not None:
+        saved = save_cached_facts(path, deduped, cache_path)
+        logger.info("Saved %s facts for %s to cache file %s", len(deduped), path, saved)
+    return deduped

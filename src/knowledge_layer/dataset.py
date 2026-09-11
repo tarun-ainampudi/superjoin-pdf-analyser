@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import List
 
+from .cache import get_dataset_cache_dir
 from .fact_extraction import extract_facts_from_pdf
 
 
@@ -17,7 +18,9 @@ def load_default_documents(base_dir: str) -> List[str]:
 
 def load_all_facts(base_dir: str, progress_cb=None, max_pages: int = None) -> List:
     """Extract facts from every starter PDF in ``base_dir``."""
+    root = Path(base_dir).resolve().parent
+    cache_dir = get_dataset_cache_dir(root)
     all_facts = []
     for pdf_path in load_default_documents(base_dir):
-        all_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=progress_cb, max_pages=max_pages))
+        all_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=progress_cb, max_pages=max_pages, cache_dir=cache_dir))
     return all_facts

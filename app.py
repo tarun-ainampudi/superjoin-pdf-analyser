@@ -1,5 +1,7 @@
+import logging
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import streamlit as st
@@ -8,18 +10,45 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.knowledge_layer import (
+    get_active_backend,
+    get_used_backend,
     ollama_available,
+    reset_availability,
     extract_facts_from_pdf,
     compare_facts,
     select_four_cases,
-    load_all_facts,
     load_default_documents,
 )
-from src.knowledge_layer.config import MAX_PAGES_PER_PDF
+from src.knowledge_layer.cache import clear_session_cache, get_dataset_cache_dir, get_session_cache_dir
+from src.knowledge_layer.config import GEMINI_MODEL, MAX_PAGES_PER_PDF
 
 st.set_page_config(page_title="Superjoin Fact Knowledge Layer", layout="wide")
 
-DATASET_ROOT = Path(__file__).resolve().parent / "dataset"
+ROOT_DIR = Path(__file__).resolve().parent
+DATASET_ROOT = ROOT_DIR / "dataset"
+DATASET_CACHE_DIR = get_dataset_cache_dir(ROOT_DIR)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = uuid.uuid4().hex
+    clear_session_cache(ROOT_DIR)
+    logging.info("Initialized new app session %s and cleared session cache", st.session_state["session_id"])
+
+if "model_events" not in st.session_state:
+    st.session_state["model_events"] = []
+
+SESSION_CACHE_DIR = get_session_cache_dir(ROOT_DIR, st.session_state["session_id"])
+logging.info("Dataset cache dir: %s", DATASET_CACHE_DIR)
+logging.info("Session cache dir: %s", SESSION_CACHE_DIR)
+
+# Re-probe each model's availability once per run so the UI reflects backend
+# changes (e.g. Ollama started/stopped). Within a run the results are cached,
+# so a model is never probed more than once per run.
+reset_availability()
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -29,10 +58,18 @@ with st.sidebar:
         type=["pdf"],
         accept_multiple_files=True,
     )
-    backend = "Ollama (granite4.1:3b)" if ollama_available() else "Generic heuristic"
+    active_backend = get_used_backend()
+    if active_backend == "gemini":
+        backend = f"Gemini API ({GEMINI_MODEL})"
+    elif active_backend == "ollama":
+        backend = "Ollama (granite4.1:3b)"
+    elif active_backend == "cache":
+        backend = "Loaded from cahce"
+    else:
+        backend = "Generic heuristic"
     st.success(f"Backend: {backend}")
     st.info(
-        "Upload any PDF or use the starter dataset. "
+        "Upload any PDF. "
         "The system automatically extracts grounded facts, compares them "
         "across documents, and shows the four required cases."
     )
@@ -49,7 +86,9 @@ if uploaded:
         docs = [str(p) for p in sorted(temp_path.glob("*.pdf"))]
 
         if st.session_state.get("upload_key") != upload_key:
+            st.session_state["model_events"] = []
             progress = st.progress(0.0, text="Extracting facts from uploaded PDFs...")
+            log_placeholder = st.empty()
             n_docs = len(docs)
             counter = {"doc": 0}
 
@@ -59,20 +98,46 @@ if uploaded:
                     text=f"Extracting page {done}/{total} of document {counter['doc'] + 1}/{n_docs}...",
                 )
 
+            def on_model_status(pdf_name: str, page: int, raw: str):
+                backend = get_used_backend() or get_active_backend()
+                event = {
+                    "pdf_name": Path(pdf_name).name,
+                    "page": page,
+                    "backend": backend,
+                    "response": raw[:1200],
+                }
+                st.session_state["model_events"].append(event)
+                with log_placeholder.container():
+                    for item in st.session_state["model_events"]:
+                        st.markdown(f"**{item['pdf_name']}** — page {item['page']} — **{item['backend']}**")
+                        st.code(item["response"] or "No response returned", language=None)
+
             session_facts = []
             for pdf_path in docs:
-                session_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=on_extract,
-                                                            max_pages=MAX_PAGES_PER_PDF))
+                logging.info("Processing uploaded PDF %s with session cache %s", pdf_path, SESSION_CACHE_DIR)
+                session_facts.extend(
+                    extract_facts_from_pdf(
+                        pdf_path,
+                        progress_cb=on_extract,
+                        max_pages=MAX_PAGES_PER_PDF,
+                        cache_dir=SESSION_CACHE_DIR,
+                        status_cb=on_model_status,
+                    )
+                )
+                st.session_state["used_backend"] = get_used_backend() or get_active_backend()
                 counter["doc"] += 1
             progress.empty()
             st.session_state["upload_key"] = upload_key
             st.session_state["facts"] = session_facts
             st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+            st.success(f"Finished processing {len(docs)} uploaded document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
         facts = st.session_state.get("facts", [])
 else:
     docs = load_default_documents(str(DATASET_ROOT))
     if not st.session_state.get("default_loaded"):
+        st.session_state["model_events"] = []
         progress = st.progress(0.0, text="Extracting facts from starter PDFs...")
+        log_placeholder = st.empty()
         n_docs = len(docs)
         counter = {"doc": 0}
 
@@ -82,15 +147,39 @@ else:
                 text=f"Extracting page {done}/{total} of document {counter['doc'] + 1}/{n_docs}...",
             )
 
+        def on_model_status(pdf_name: str, page: int, raw: str):
+            backend = get_used_backend() or get_active_backend()
+            event = {
+                "pdf_name": Path(pdf_name).name,
+                "page": page,
+                "backend": backend,
+                "response": raw[:1200],
+            }
+            st.session_state["model_events"].append(event)
+            with log_placeholder.container():
+                for item in st.session_state["model_events"]:
+                    st.markdown(f"**{item['pdf_name']}** — page {item['page']} — **{item['backend']}**")
+                    st.code(item["response"] or "No response returned", language=None)
+
         session_facts = []
         for pdf_path in docs:
-            session_facts.extend(extract_facts_from_pdf(pdf_path, progress_cb=on_extract,
-                                                        max_pages=MAX_PAGES_PER_PDF))
+            logging.info("Processing default dataset PDF %s with dataset cache %s", pdf_path, DATASET_CACHE_DIR)
+            session_facts.extend(
+                extract_facts_from_pdf(
+                    pdf_path,
+                    progress_cb=on_extract,
+                    max_pages=MAX_PAGES_PER_PDF,
+                    cache_dir=DATASET_CACHE_DIR,
+                    status_cb=on_model_status,
+                )
+            )
+            st.session_state["used_backend"] = get_used_backend() or get_active_backend()
             counter["doc"] += 1
         progress.empty()
         st.session_state["default_loaded"] = True
         st.session_state["facts"] = session_facts
         st.session_state["relations"] = compare_facts(session_facts, use_llm=ollama_available())
+        st.success(f"Finished processing {len(docs)} starter document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
     facts = st.session_state.get("facts", [])
 
 if not docs:

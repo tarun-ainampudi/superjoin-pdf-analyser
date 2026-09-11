@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .venv
 .env
+.cache
 .DS_Store
 .streamlit/
 superjoin-vit-2026-assignment.pdf
