@@ -1,4 +1,6 @@
 import unittest
+import urllib.error
+from unittest.mock import patch
 
 from src.knowledge_layer import llm
 
@@ -51,10 +53,51 @@ class BackendAvailabilityTests(unittest.TestCase):
             llm._ollama_reachable = orig
             llm.reset_availability()
 
+    def test_gemini_probe_uses_model_response_status(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        original_key = llm.GEMINI_API_KEY
+        llm.GEMINI_API_KEY = "test-key"
+        try:
+            with patch("src.knowledge_layer.llm.urllib.request.urlopen", return_value=Response()) as urlopen:
+                self.assertTrue(llm._gemini_reachable())
+                self.assertEqual(urlopen.call_args.args[0].get_method(), "POST")
+
+            with patch(
+                "src.knowledge_layer.llm.urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError("https://gemini.test", 429, "quota", {}, None),
+            ):
+                self.assertFalse(llm._gemini_reachable())
+        finally:
+            llm.GEMINI_API_KEY = original_key
+
+    def test_ollama_probe_uses_model_response_status(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch("src.knowledge_layer.llm.urllib.request.urlopen", return_value=Response()) as urlopen:
+            self.assertTrue(llm._ollama_reachable())
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.get_method(), "POST")
+            self.assertTrue(request.full_url.endswith("/api/chat"))
+
     def test_gemini_429_switches_to_ollama(self):
         import urllib.error
 
-        llm._availability["gemini"] = None
+        llm._availability["gemini"] = True
         llm._availability["ollama"] = None
         llm._used_backend = ""
 

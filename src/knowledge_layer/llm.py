@@ -40,6 +40,7 @@ from .config import (
     GEMINI_API_KEY,
     GEMINI_API_URL,
     GEMINI_MODEL,
+    MODEL_PROBE_TIMEOUT,
     GEMINI_TIMEOUT,
     OLLAMA_CALL_TIMEOUT,
     OLLAMA_MODEL,
@@ -58,29 +59,71 @@ class ModelTimeoutError(TimeoutError):
 class ModelUnavailableError(RuntimeError):
     """Raised after all configured model backends have been exhausted."""
 
-# Availability probes are cached per model so each backend's reachability is
-# checked only once per process (e.g. a single Ollama /api/tags round-trip),
-# rather than repeated on every call. This matters because call_model falls
-# back between backends and the UI queries availability multiple times.
+# Availability probes are cached per model so each backend receives only one
+# small real inference request per run, rather than a probe on every call.
 _availability: Dict[str, Optional[bool]] = {"ollama": None, "gemini": None}
 # The backend that most recently served a model call (updated by call_model).
 _used_backend: str = "cache"
 
 
 def _ollama_reachable() -> bool:
+    """Probe the configured Ollama *model*, not merely the local server."""
+    payload: Dict[str, Any] = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": "Reply with OK."}],
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 1},
+    }
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        req = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as r:
             status = getattr(r, "status", 200)
-            logger.info("Ollama availability check status=%s", status)
+            logger.info("Ollama model availability check status=%s model=%s", status, OLLAMA_MODEL)
             return status == 200
+    except urllib.error.HTTPError as exc:
+        logger.warning("Ollama model availability check returned HTTP %s", exc.code)
+        return False
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Ollama availability check failed: %s", exc)
+        logger.warning("Ollama model availability check failed: %s", exc)
+        return False
+
+
+def _gemini_reachable() -> bool:
+    """Probe the configured Gemini model with a minimal generation request."""
+    api_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return False
+    url = f"{GEMINI_API_URL}/models/{GEMINI_MODEL}:generateContent"
+    body = {
+        "contents": [{"parts": [{"text": "Reply with OK."}]}],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 1},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=MODEL_PROBE_TIMEOUT) as response:
+            status = getattr(response, "status", 200)
+            logger.info("Gemini model availability check status=%s model=%s", status, GEMINI_MODEL)
+            return status == 200
+    except urllib.error.HTTPError as exc:
+        logger.warning("Gemini model availability check returned HTTP %s", exc.code)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Gemini model availability check failed: %s", exc)
         return False
 
 
 def ollama_available(refresh: bool = False) -> bool:
-    """Return whether a local Ollama instance is reachable.
+    """Return whether the configured local Ollama model accepts a request.
 
     The network probe is performed only once and cached; subsequent calls in
     the same process return the remembered result unless ``refresh`` is True.
@@ -91,12 +134,12 @@ def ollama_available(refresh: bool = False) -> bool:
 
 
 def gemini_available(refresh: bool = False) -> bool:
-    """Return True if a Gemini API key is configured.
+    """Return whether the configured Gemini model accepts a real request.
 
-    Cached so the availability of each model is determined only once.
+    Cached so the probe runs only once until explicitly refreshed.
     """
     if refresh or _availability["gemini"] is None:
-        _availability["gemini"] = bool(GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "").strip())
+        _availability["gemini"] = _gemini_reachable()
         logger.info("Gemini availability: %s (model=%s)", _availability["gemini"], GEMINI_MODEL)
     return bool(_availability["gemini"])
 

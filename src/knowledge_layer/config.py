@@ -31,6 +31,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_API_URL = os.environ.get("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_TIMEOUT = _positive_float("GEMINI_TIMEOUT", 180.0)
+# Short limit for the lightweight availability inference requests. This is
+# deliberately independent from full extraction timeouts.
+MODEL_PROBE_TIMEOUT = _positive_float("MODEL_PROBE_TIMEOUT", 15.0)
 
 # Extraction tuning
 EXTRACTION_CHUNK_CHARS = _positive_int("EXTRACTION_CHUNK_CHARS", 1200)

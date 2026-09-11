@@ -111,18 +111,35 @@ if uploaded:
                 )
 
             def on_model_status(pdf_name: str, page: int, raw: str):
-                backend = get_used_backend() or get_active_backend()
-                event = {
-                    "pdf_name": Path(pdf_name).name,
-                    "page": page,
-                    "backend": backend,
-                    "response": raw[:1200],
-                }
-                st.session_state["model_events"].append(event)
+                # call_model records the backend that produced this exact
+                # response. Persist it and repaint the sidebar immediately,
+                # rather than waiting for the full PDF to complete.
+                backend = get_used_backend() or "heuristic"
+                st.session_state["used_backend"] = backend
+                _render_backend_status()
+                page_name = Path(pdf_name).name
+                events = st.session_state["model_events"]
+                # One PDF page can contain multiple extraction chunks. Keep
+                # those responses together and move the just-updated page to
+                # the top instead of rendering duplicate page rows.
+                event = next(
+                    (item for item in events if item["pdf_name"] == page_name and item["page"] == page),
+                    None,
+                )
+                if event is None:
+                    event = {"pdf_name": page_name, "page": page, "backend": backend, "responses": []}
+                else:
+                    events.remove(event)
+                    event["backend"] = backend
+                event["responses"].append(raw[:1200])
+                events.insert(0, event)
                 with log_placeholder.container():
-                    for item in st.session_state["model_events"]:
-                        st.markdown(f"**{item['pdf_name']}** — page {item['page']} — **{item['backend']}**")
-                        st.code(item["response"] or "No response returned", language=None)
+                    for item in events:
+                        st.markdown(
+                            f"**{item['pdf_name']}** — page {item['page']} — "
+                            f"**{item['backend']}** ({len(item['responses'])} chunk(s))"
+                        )
+                        st.code("\n\n".join(item["responses"]) or "No response returned", language=None)
 
             session_facts = []
             document_backends = []
@@ -154,6 +171,10 @@ if uploaded:
                 session_facts,
                 use_llm=False if all_from_cache else get_active_backend() != "none",
             )
+            # The per-page model output is only a live processing aid. Remove
+            # it once the final knowledge-layer output is ready.
+            log_placeholder.empty()
+            st.session_state["model_events"] = []
             st.success(f"Finished processing {len(docs)} uploaded document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
         facts = st.session_state.get("facts", [])
 else:
@@ -172,18 +193,29 @@ else:
             )
 
         def on_model_status(pdf_name: str, page: int, raw: str):
-            backend = get_used_backend() or get_active_backend()
-            event = {
-                "pdf_name": Path(pdf_name).name,
-                "page": page,
-                "backend": backend,
-                "response": raw[:1200],
-            }
-            st.session_state["model_events"].append(event)
+            backend = get_used_backend() or "heuristic"
+            st.session_state["used_backend"] = backend
+            _render_backend_status()
+            page_name = Path(pdf_name).name
+            events = st.session_state["model_events"]
+            event = next(
+                (item for item in events if item["pdf_name"] == page_name and item["page"] == page),
+                None,
+            )
+            if event is None:
+                event = {"pdf_name": page_name, "page": page, "backend": backend, "responses": []}
+            else:
+                events.remove(event)
+                event["backend"] = backend
+            event["responses"].append(raw[:1200])
+            events.insert(0, event)
             with log_placeholder.container():
-                for item in st.session_state["model_events"]:
-                    st.markdown(f"**{item['pdf_name']}** — page {item['page']} — **{item['backend']}**")
-                    st.code(item["response"] or "No response returned", language=None)
+                for item in events:
+                    st.markdown(
+                        f"**{item['pdf_name']}** — page {item['page']} — "
+                        f"**{item['backend']}** ({len(item['responses'])} chunk(s))"
+                    )
+                    st.code("\n\n".join(item["responses"]) or "No response returned", language=None)
 
         session_facts = []
         document_backends = []
@@ -215,6 +247,8 @@ else:
             session_facts,
             use_llm=False if all_from_cache else get_active_backend() != "none",
         )
+        log_placeholder.empty()
+        st.session_state["model_events"] = []
         st.success(f"Finished processing {len(docs)} starter document(s) using {st.session_state.get('used_backend', get_active_backend())}.")
     facts = st.session_state.get("facts", [])
 

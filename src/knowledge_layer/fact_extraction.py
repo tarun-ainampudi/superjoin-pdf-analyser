@@ -177,7 +177,9 @@ def extract_facts_from_pdf(path: str,
         if progress_cb:
             progress_cb("extracting", done, total)
 
-    if ollama_available() or gemini_available():
+    # Gemini is the preferred backend; do not warm up Ollama when Gemini is
+    # ready to serve the extraction.
+    if gemini_available() or ollama_available():
         logger.info("AI backend available for %s; extracting facts with LLM path", path)
         try:
             facts = extract_facts_with_ollama(filename, pages, path, progress_cb=passthrough, status_cb=status_cb)
@@ -186,10 +188,12 @@ def extract_facts_from_pdf(path: str,
             facts = []
         if not facts:
             logger.warning("LLM extraction returned no usable facts for %s; falling back to heuristic extractor", path)
+            set_used_backend("heuristic")
             facts = heuristic_extract_all_pages(filename, pages, path)
         deduped = dedupe(facts)
     else:
         logger.warning("No AI backend available for %s; using heuristic extractor", path)
+        set_used_backend("heuristic")
         deduped = dedupe(heuristic_extract_all_pages(filename, pages, path))
 
     if use_cache and cache_path is not None:
