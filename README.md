@@ -1,119 +1,156 @@
-# Superjoin VIT 2026 — Fact Knowledge Layer
+# Superjoin — PDF Fact Knowledge Layer
 
-Extracts grounded facts from any PDF, compares them across documents, and explains corroboration, contradiction, and contextual reconciliation — powered by the local Ollama granite4.1:3b model.
+A Streamlit application that extracts grounded facts from PDFs, compares related facts across documents, and presents evidence-backed relationship checks. It ships with a starter dataset and also accepts external PDF uploads.
 
-## Setup and Run Instructions
+The application uses a resilient model chain:
 
-### Prerequisites
+1. Gemini, when a configured Gemini model accepts a live probe request.
+2. Local Ollama, when the configured local model accepts a live probe request.
+3. A generic offline heuristic extractor when neither model can serve the request.
 
-1. **Python 3.10+**
-2. **Ollama** (local LLM backend) — install from [ollama.com](https://ollama.com), then pull the model:
-   ```bash
-   ollama pull granite4.1:3b
-   ```
-   Verify it is running: `ollama list` should show `granite4.1:3b`.
+## Features
 
-### Install and Run
+- Extracts text from PDFs with PyMuPDF and processes it in sentence-aware chunks.
+- Produces grounded facts containing a source, page number, value, unit, period, basis, concept, confidence, and evidence snippet.
+- Repairs JSON arrays, individual objects, and concatenated JSON objects returned by models.
+- Compares facts as corroborated, contradictory, reconciled by context, or different in scope.
+- Selects the four demonstration cases from the relationships actually found in the current document set.
+- Shows the active backend in the sidebar and updates it as model responses arrive.
+- Groups live extraction output by page, with the latest processed page first; the live output is removed when final results are ready.
+- Persists dataset and upload fact caches, including compatibility with the previous cache-key format.
+
+## Requirements
+
+- Python 3.10 or later
+- One of the following is optional but recommended for model-assisted extraction:
+  - A Gemini API key
+  - [Ollama](https://ollama.com/) with a pulled model, such as `granite4.1:3b`
+
+Without either model backend, the app still works with the offline heuristic extractor.
+
+## Install and run
 
 ```bash
+git clone https://github.com/tarun-ainampudi/superjoin-pdf-analyser.git
 cd superjoin-pdf-analyser
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate    # macOS / Linux
-pip install -r requirements.txt
 
+python -m venv .venv
+.venv\Scripts\activate
+# On macOS/Linux: source .venv/bin/activate
+
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Open http://localhost:8501. Upload any PDF or click through the starter dataset under `dataset/`.
+Open the local URL printed by Streamlit, normally `http://localhost:8501`.
 
-### Environment Variables (optional)
+The app loads the PDFs in `dataset/` by default. Use the sidebar uploader to analyse one or more external PDFs instead.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `granite4.1:3b` | Model to use for extraction |
-| `OLLAMA_CALL_TIMEOUT` | `60` | Max seconds for a single Ollama response before falling back to the heuristic extractor |
-| `EXTRACTION_CHUNK_CHARS` | `1200` | Max chars per LLM prompt chunk |
-| `MAX_PAGES_PER_PDF` | `20` | Cap on pages processed per PDF |
+## Model setup
 
-## Project Structure
+### Gemini
 
+Set `GEMINI_API_KEY` in your environment or in a local `.env` file:
+
+```env
+GEMINI_API_KEY=your-api-key
+GEMINI_MODEL=gemini-flash-latest
 ```
+
+Gemini availability is not inferred from the presence of a key. The application sends a short `generateContent` probe to the configured model and treats an HTTP `200` response as available.
+
+### Ollama
+
+Install Ollama, then pull and serve the model:
+
+```bash
+ollama pull granite4.1:3b
+ollama serve
+```
+
+Ollama availability is also verified with a short `/api/chat` request to the configured model. A running server without the requested model is therefore treated as unavailable.
+
+## Backend selection and fallbacks
+
+For a fresh extraction, Gemini is preferred. If it cannot respond, the app tries Ollama. If both fail, or an Ollama response times out, it extracts generic numerical facts locally.
+
+- A Gemini `400`, `401`, `403`, `404`, or `429` disables Gemini for the current run and proceeds to Ollama.
+- Ollama applies the configured retry budget; after it is exhausted, the rest of the document uses the heuristic path rather than repeatedly waiting for failed requests.
+- A fully cached document set does not call Gemini or Ollama merely to regenerate relationship explanations. It uses the deterministic comparison heuristic so cached loads remain fast.
+
+The sidebar reports the backend that actually supplied the current result: Gemini, Ollama, cache, or the generic heuristic.
+
+## Caching
+
+Fact extraction is cached as JSON under `.cache/`:
+
+```text
+.cache/
+├── dataset/                 # Persistent cache for the bundled starter PDFs
+└── session/<session-id>/    # Cache for PDFs uploaded during one app session
+```
+
+Cache keys use a SHA-256 hash of the PDF content, so the same upload can be reused even when Streamlit writes it to a different temporary directory. Cache writes are atomic, corrupted entries are discarded safely, and an empty extraction result is still a valid cache hit.
+
+Existing cache files written by the earlier filename/size/mtime/path key are read when the original PDF remains at the same location, then migrated automatically to the content-hash key.
+
+## Configuration
+
+All settings are optional environment variables. Values below are defaults.
+
+| Variable | Default | Description |
+|---|---:|---|
+| `GEMINI_API_KEY` | empty | Gemini API key; enables Gemini probing and requests. |
+| `GEMINI_MODEL` | `gemini-flash-latest` | Gemini model used for probing and generation. |
+| `GEMINI_API_URL` | Google Generative Language v1beta URL | Gemini API base URL. |
+| `GEMINI_TIMEOUT` | `180` | Maximum seconds for a full Gemini generation request. |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL. |
+| `OLLAMA_MODEL` | `granite4.1:3b` | Local model used for probing and generation. |
+| `OLLAMA_RETRIES` | `3` | Retry count for failed Ollama chat requests. |
+| `OLLAMA_CALL_TIMEOUT` | `60` | Maximum seconds for one Ollama generation request. |
+| `MODEL_PROBE_TIMEOUT` | `15` | Maximum seconds for each lightweight model availability probe. |
+| `EXTRACTION_CHUNK_CHARS` | `1200` | Maximum characters in one extraction prompt chunk. |
+| `MAX_FACTS_PER_CHUNK` | `40` | Maximum accepted facts from a model response chunk. |
+| `MAX_PAGES_PER_PDF` | `20` | Maximum pages processed for each PDF. |
+| `RELATION_BUDGET` | `40` | Maximum model-assisted relationship checks per run. |
+
+Invalid numeric values use defaults; non-positive values are coerced to safe positive limits.
+
+## Project structure
+
+```text
 superjoin-pdf-analyser/
-├── app.py                              # Streamlit UI
-├── src/knowledge_layer/                # Core engine (modular package)
-│   ├── config.py                       # Env-var configuration
-│   ├── models.py                       # Fact dataclass
-│   ├── text_extraction.py              # PyMuPDF page extraction + chunking
-│   ├── llm.py                          # Ollama + Gemini clients, fallback, JSON repair
-│   ├── normalization.py                # Unit/period/basis/concept inference
-│   ├── heuristic.py                    # Generic offline fallback extractor
-│   ├── fact_extraction.py              # Orchestrator (serial model calls)
-│   ├── comparison.py                   # Cross-document relationship reasoning
-│   ├── cases.py                        # Dynamic four-case selection
-│   └── dataset.py                      # Dataset file discovery
-├── dataset/                            # Starter PDFs
-│   ├── delhivery/
-│   └── india-macroeconomy/
+├── app.py                              # Streamlit user interface
+├── src/knowledge_layer/
+│   ├── cache.py                        # Content-addressed cache and migration
+│   ├── comparison.py                   # Fact relationship classification
+│   ├── config.py                       # Environment configuration
+│   ├── dataset.py                      # Starter-PDF discovery
+│   ├── fact_extraction.py              # Extraction orchestration and fallback
+│   ├── heuristic.py                    # Offline generic numeric extractor
+│   ├── llm.py                          # Gemini/Ollama clients and probes
+│   ├── models.py                       # Fact data model
+│   ├── normalization.py                # Value, unit, period, and concept helpers
+│   └── text_extraction.py              # PyMuPDF extraction and chunking
+├── dataset/                            # Delhivery and India macroeconomy PDFs
+├── tests/                              # Cache and backend regression tests
 ├── requirements.txt
 └── README.md
 ```
 
-## Approach
+## Testing
 
-### Core Idea
+Run the test suite from the repository root:
 
-Each fact is a grounded statement carrying: source document, page, subject, value, unit, period, basis, an evidence snippet, and a concept tag. This lets the system always explain *why* a fact is believed and point to its location in the source.
+```bash
+python -m unittest discover -s tests -v
+```
 
-### Extraction Pipeline
+The tests cover backend-probe caching, Gemini-to-Ollama fallback, timeout handling, cache key portability, corrupt-cache recovery, legacy-cache migration, and cache backend reporting.
 
-1. **PyMuPDF** extracts raw text from every PDF page.
-2. Text is split into sentence-aware chunks (default ~1200 chars).
-3. Each chunk is sent to the active model **one request at a time (serial)**, asking for structured JSON facts.
-4. The model's response — which may be a JSON array, a single object, or concatenated objects — is **repaired and validated** into the strict `Fact` schema.
-5. Facts are deduplicated across chunks and normalised (units, periods, concepts).
-6. Fallbacks (in order): **Gemini API** (if a key is configured) → **Ollama** → **generic heuristic extractor** (no document-specific rules).
-   - A Gemini **429 (quota exceeded)** hands straight off to Ollama.
-   - If an **Ollama response takes more than one minute**, extraction falls back to the heuristic extractor.
+## Limitations
 
-This is completely document-agnostic: no facts, filenames, schemas, or document-specific regex patterns are hard-coded.
-
-### Comparison and Reasoning
-
-Facts sharing a semantic concept are paired and classified as:
-
-- **Corroborated** — same concept, values agree within rounding
-- **Contradiction** — same concept, values disagree
-- **Reconciled by context** — values differ but the gap is explained by period, units, basis, or scope
-- **Different scope** — facts describe different subjects entirely
-
-The local model writes the human-readable explanation. A heuristic fallback covers the offline case.
-
-### Dynamic Four Cases
-
-The four required demonstration cases are **not hard-coded**. They are selected from the relationships actually produced during the current run, so the demo always reflects real extracted evidence.
-
-### AI Tools Used
-
-- **Ollama granite4.1:3b** — local LLM for extraction and reasoning (no API key required)
-- **PyMuPDF** — PDF text extraction
-- **Streamlit** — upload-and-inspect interface
-- **Python stdlib** — no external LLM SDKs needed
-
-## Limitations and Next Steps
-
-- **3b model constraints**: granite4.1:3b sometimes produces shallow or noisy extractions and may miss implicit relationships. A larger model (e.g. 8-13B) would improve coverage.
-- **Period inference**: the model sometimes omits the `period` field; this is patched automatically via regex inference on the subject text.
-- **Slow per-chunk**: each chunk takes ~5-15s on a local 3b model, so a 30-page PDF takes a few minutes. Requests are made serially on purpose so a free/quota-limited model is never hammered; an Ollama call that exceeds `OLLAMA_CALL_TIMEOUT` (default 1 minute) automatically falls back to the heuristic extractor.
-- **No incremental ingestion**: facts are re-extracted from scratch each time; a persistent store would help for large document sets.
-
-Next steps:
-- Upgrade to a larger Ollama model (e.g. `llama3.1:8b` or `mistral:7b`)
-- Add a persistent fact store with incremental ingestion
-- Add graph visualisation of concept relationships
-- Add user feedback loop for extraction quality
-
-## Additional Notes
-
-The system is built to generalise beyond the starter documents. It accepts any PDF through the UI, uses no hard-coded facts or document-specific rules, and dynamically derives the four required cases from the extracted evidence. Every fact is grounded in a source snippet and compared with reasoning — not just raw numeric matching.
+- PDF quality, tables, and scanned pages can affect text extraction and fact quality.
+- The heuristic fallback focuses on generic numeric patterns and is less precise than a working model backend.
+- Facts and relationships should be reviewed against their displayed evidence before being used for important decisions.
+- The app processes model requests serially to reduce local load and API quota pressure; large fresh PDFs can therefore take time.
